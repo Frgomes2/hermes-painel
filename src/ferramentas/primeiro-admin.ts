@@ -1,5 +1,6 @@
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
+import { carregarEnv } from '../lib/env';
 
 /**
  * Cria o primeiro acesso ao painel de uma empresa.
@@ -22,6 +23,8 @@ import bcrypt from 'bcryptjs';
  * Uso:
  *   npm run admin:primeiro -- --slug frx-code --email voce@exemplo.com --senha "algo longo"
  */
+
+carregarEnv();
 
 function argumento(nome: string): string | undefined {
   const i = process.argv.indexOf(`--${nome}`);

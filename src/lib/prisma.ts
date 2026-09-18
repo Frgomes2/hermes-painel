@@ -52,11 +52,51 @@ const global_ = globalThis as unknown as { prismaDoPainel?: PrismaClient };
 const NIVEIS: Prisma.LogLevel[] =
   process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'];
 
-export const prisma =
-  global_.prismaDoPainel ??
-  new PrismaClient({ datasourceUrl: urlDaAplicacao(), log: NIVEIS });
+/**
+ * O cliente nasce na PRIMEIRA CONSULTA, nunca na importacao do modulo.
+ *
+ * ---------------------------------------------------------------------------
+ * POR QUE ISTO NAO E FRESCURA
+ * ---------------------------------------------------------------------------
+ * `next build` importa cada rota para ler a configuracao dela — o `dynamic`, o
+ * `revalidate`. Importar, so isso, sem atender requisicao nenhuma. Se o cliente
+ * do banco for criado no nivel do modulo, essa leitura EXIGE as variaveis de
+ * ambiente, e o build quebra com "DATABASE_URL ausente" numa maquina que nunca
+ * precisou falar com o banco.
+ *
+ * Pior: o erro aponta para a pagina (`Failed to collect page data for
+ * /simulador`), quando a pagina nao tem nada a ver com isso.
+ *
+ * Adiar tambem separa duas perguntas que estavam grudadas: "o codigo compila?"
+ * e "a configuracao esta certa?". A primeira e do build; a segunda e de quem
+ * sobe o servico — e o erro aparece na hora certa, com o texto certo.
+ */
+let memoizado: PrismaClient | null = null;
 
-if (process.env.NODE_ENV !== 'production') global_.prismaDoPainel = prisma;
+function cliente(): PrismaClient {
+  if (memoizado) return memoizado;
+
+  memoizado =
+    global_.prismaDoPainel ??
+    new PrismaClient({ datasourceUrl: urlDaAplicacao(), log: NIVEIS });
+
+  if (process.env.NODE_ENV !== 'production') global_.prismaDoPainel = memoizado;
+  return memoizado;
+}
+
+/**
+ * Mesma cara de sempre (`prisma.usuario.findMany(...)`), so que a conexao so
+ * existe quando alguem realmente usa. O Proxy evita ter que trocar toda chamada
+ * por `cliente().usuario...` — a indirecao fica em um lugar so.
+ */
+export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
+  get(_alvo, propriedade) {
+    const c = cliente();
+    const valor = c[propriedade as keyof PrismaClient];
+    // Metodos precisam do `this` certo; `$transaction` sem bind perde o cliente.
+    return typeof valor === 'function' ? (valor as Function).bind(c) : valor;
+  },
+});
 
 /**
  * Executa dentro de uma transacao com `app.empresa_id` definido.
