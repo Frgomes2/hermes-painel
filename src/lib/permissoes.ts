@@ -107,9 +107,9 @@ export async function menuVisivel(u: UsuarioDaSessao): Promise<MenuVisivel> {
       select: { modulo: { select: { chave: true } } },
     })
   );
-  const modulos = new Set(contratados.map((c) => c.modulo.chave));
+  const modulos = new Set<string>(contratados.map((c) => c.modulo.chave));
 
-  if (u.ehAdmin) return { rotas: new Set(ROTAS), modulos };
+  if (u.ehAdmin) return { rotas: new Set<string>(ROTAS), modulos };
   if (!u.grupoId) return { rotas: new Set<string>(), modulos };
 
   const permissoes = await comEmpresa(u.empresaId, (tx) =>
@@ -119,5 +119,5 @@ export async function menuVisivel(u: UsuarioDaSessao): Promise<MenuVisivel> {
     })
   );
 
-  return { rotas: new Set(permissoes.map((p) => p.rota)), modulos };
+  return { rotas: new Set<string>(permissoes.map((p) => p.rota)), modulos };
 }

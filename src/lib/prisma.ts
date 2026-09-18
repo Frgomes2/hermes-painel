@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 
 /**
  * A conexao do painel com o banco do Hermes.
@@ -48,12 +48,13 @@ function urlDaAplicacao(): string {
  */
 const global_ = globalThis as unknown as { prismaDoPainel?: PrismaClient };
 
+/** Tipado de proposito: um array de string cru nao e aceito pelo construtor. */
+const NIVEIS: Prisma.LogLevel[] =
+  process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'];
+
 export const prisma =
   global_.prismaDoPainel ??
-  new PrismaClient({
-    datasources: { db: { url: urlDaAplicacao() } },
-    log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
-  });
+  new PrismaClient({ datasourceUrl: urlDaAplicacao(), log: NIVEIS });
 
 if (process.env.NODE_ENV !== 'production') global_.prismaDoPainel = prisma;
 
@@ -72,9 +73,7 @@ if (process.env.NODE_ENV !== 'production') global_.prismaDoPainel = prisma;
  */
 export async function comEmpresa<T>(
   empresaId: string,
-  fn: (
-    tx: Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>
-  ) => Promise<T>
+  fn: (tx: Prisma.TransactionClient) => Promise<T>
 ): Promise<T> {
   // Barra injecao e, principalmente, barra `undefined` virando a string
   // "undefined" — que o set_config aceitaria de boa vontade, fazendo toda
