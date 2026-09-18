@@ -8,22 +8,32 @@ import { prisma, comEmpresa } from './prisma';
  * Login, sessao e bloqueio por tentativas.
  *
  * ---------------------------------------------------------------------------
- * AS DECISOES QUE IMPORTAM
+ * POR QUE O LOGIN PASSA POR FUNCAO DO BANCO
+ * ---------------------------------------------------------------------------
+ * `usuarios` e `sessoes` estao sob RLS, e a politica compara `empresaId` com
+ * `current_setting('app.empresa_id')`. No login existe apenas um e-mail: qual e
+ * a empresa E o que se quer descobrir.
+ *
+ * Uma consulta comum aqui nao daria erro — voltaria VAZIA. E o sintoma seria o
+ * pior possivel: "E-mail ou senha incorretos" para a senha certa, sempre, sem
+ * nada no log. Foi exatamente o que aconteceu na primeira versao deste arquivo.
+ *
+ * Por isso a leitura passa por `autenticar_usuario` e `sessao_por_token`,
+ * funcoes SECURITY DEFINER em `prisma/sql/04-acesso.sql`. Mesma solucao do
+ * roteamento de canal, pelo mesmo motivo. Depois do login, com a empresa em
+ * maos, tudo volta a passar por `comEmpresa`.
+ *
+ * ---------------------------------------------------------------------------
+ * AS OUTRAS DECISOES
  * ---------------------------------------------------------------------------
  * **A mesma mensagem para senha errada e usuario inexistente.** Distinguir as
- * duas entrega de graca quais e-mails existem na plataforma — e numa plataforma
- * multiempresa isso e informacao sobre os clientes, nao so sobre o acesso.
+ * duas entrega de graca quais e-mails existem na plataforma.
  *
  * **O token vai para o cookie; o banco guarda o HASH dele.** Mesma logica da
- * senha: se o banco vazar, ninguem sai por ai com sessoes ativas na mao.
+ * senha: se o banco vazar, ninguem sai com sessoes ativas na mao.
  *
- * **Bloqueio depois de 5 erros.** Sem ele, uma lista de senhas comuns testa a
- * plataforma inteira em minutos. O bloqueio e por usuario e temporario, porque
- * bloquear para sempre transforma um ataque em negacao de servico contra o
- * proprio cliente.
- *
- * **Sessao em tabela, nao em token assinado** — para poder revogar. Ver o
- * comentario do model `Sessao` no schema.
+ * **Bloqueio depois de 5 erros**, temporario — bloquear para sempre
+ * transformaria um ataque em negacao de servico contra o proprio cliente.
  */
 
 const COOKIE = 'hermes_sessao';
@@ -32,8 +42,8 @@ const TENTATIVAS_ATE_BLOQUEIO = 5;
 const MINUTOS_DE_BLOQUEIO = 15;
 const CUSTO_BCRYPT = 12;
 
-/** Hash do token de sessao. SHA-256 basta: o token ja e aleatorio de 256 bits,
- *  entao nao ha o que "adivinhar" — diferente de senha, que e curta e humana. */
+/** Hash do token. SHA-256 basta: o token ja e aleatorio de 256 bits, entao nao
+ *  ha o que adivinhar — diferente de senha, que e curta e humana. */
 function hashDoToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
@@ -52,13 +62,38 @@ export type UsuarioDaSessao = {
   grupoId: string | null;
 };
 
-export type ResultadoDoLogin =
-  | { ok: true }
-  | { ok: false; erro: string };
+export type ResultadoDoLogin = { ok: true } | { ok: false; erro: string };
 
-/**
- * Entra. Devolve sempre a mesma mensagem nos casos de credencial invalida.
- */
+type LinhaDeAutenticacao = {
+  usuario_id: string;
+  empresa_id: string;
+  nome: string;
+  email: string;
+  senha_hash: string;
+  papel: string;
+  grupo_id: string | null;
+  ativo: boolean;
+  tentativas: number;
+  bloqueado_ate: Date | null;
+  empresa_nome: string;
+  empresa_ativa: boolean;
+};
+
+type LinhaDeSessao = {
+  sessao_id: string;
+  empresa_id: string;
+  usuario_id: string;
+  expira_em: Date;
+  revogada_em: Date | null;
+  nome: string;
+  email: string;
+  papel: string;
+  grupo_id: string | null;
+  usuario_ativo: boolean;
+  empresa_nome: string;
+  empresa_ativa: boolean;
+};
+
 export async function entrar(
   email: string,
   senha: string,
@@ -69,82 +104,70 @@ export async function entrar(
 
   if (!limpo || !senha) return { ok: false, erro: generico };
 
-  // Busca FORA do RLS: ainda nao se sabe de qual empresa a pessoa e — e essa
-  // e justamente a informacao que o login precisa descobrir. Por isso a
-  // consulta e estreita de proposito: so o necessario para autenticar.
-  const usuario = await prisma.usuario.findFirst({
-    where: { email: limpo, ativo: true },
-    select: {
-      id: true,
-      nome: true,
-      email: true,
-      senhaHash: true,
-      papel: true,
-      grupoId: true,
-      empresaId: true,
-      tentativas: true,
-      bloqueadoAte: true,
-      empresa: { select: { nome: true, ativa: true } },
-    },
-  });
+  const linhas = await prisma.$queryRaw<LinhaDeAutenticacao[]>`
+    SELECT * FROM autenticar_usuario(${limpo})
+  `;
+  const u = linhas[0];
 
   // `bcrypt.compare` contra um hash descartavel mesmo sem usuario: sem isso, a
   // resposta para e-mail inexistente volta muito mais rapido do que para senha
   // errada, e o tempo entrega a diferenca que a mensagem esconde.
-  if (!usuario) {
+  if (!u || !u.ativo) {
     await bcrypt.compare(senha, '$2a$12$invalidoinvalidoinvalidoinvalidoinvalidoinvalidoinva');
     return { ok: false, erro: generico };
   }
 
-  if (usuario.bloqueadoAte && usuario.bloqueadoAte > new Date()) {
-    const faltam = Math.ceil((usuario.bloqueadoAte.getTime() - Date.now()) / 60000);
+  if (u.bloqueado_ate && u.bloqueado_ate > new Date()) {
+    const faltam = Math.ceil((u.bloqueado_ate.getTime() - Date.now()) / 60000);
     return {
       ok: false,
       erro: `Acesso bloqueado por tentativas. Tente de novo em ${faltam} minuto(s).`,
     };
   }
 
-  if (!usuario.empresa.ativa) {
+  if (!u.empresa_ativa) {
     return { ok: false, erro: 'Esta empresa esta inativa. Fale com o suporte.' };
   }
 
-  const confere = await bcrypt.compare(senha, usuario.senhaHash);
+  const confere = await bcrypt.compare(senha, u.senha_hash);
 
+  // Daqui para baixo a empresa e conhecida, entao tudo volta a passar pelo RLS.
   if (!confere) {
-    const tentativas = usuario.tentativas + 1;
-    await prisma.usuario.update({
-      where: { id: usuario.id },
-      data: {
-        tentativas,
-        bloqueadoAte:
-          tentativas >= TENTATIVAS_ATE_BLOQUEIO
-            ? new Date(Date.now() + MINUTOS_DE_BLOQUEIO * 60_000)
-            : null,
-      },
-    });
+    const tentativas = u.tentativas + 1;
+    await comEmpresa(u.empresa_id, (tx) =>
+      tx.usuario.update({
+        where: { id: u.usuario_id },
+        data: {
+          tentativas,
+          bloqueadoAte:
+            tentativas >= TENTATIVAS_ATE_BLOQUEIO
+              ? new Date(Date.now() + MINUTOS_DE_BLOQUEIO * 60_000)
+              : null,
+        },
+      })
+    );
     return { ok: false, erro: generico };
   }
 
-  // --- deu certo ----------------------------------------------------------
   const token = randomBytes(32).toString('hex');
   const expiraEm = new Date(Date.now() + HORAS_DE_SESSAO * 3600_000);
 
-  await prisma.$transaction([
-    prisma.usuario.update({
-      where: { id: usuario.id },
+  await comEmpresa(u.empresa_id, async (tx) => {
+    await tx.usuario.update({
+      where: { id: u.usuario_id },
       data: { tentativas: 0, bloqueadoAte: null, ultimoAcesso: new Date() },
-    }),
-    prisma.sessao.create({
+    });
+    await tx.sessao.create({
       data: {
-        empresaId: usuario.empresaId,
-        usuarioId: usuario.id,
+        empresaId: u.empresa_id,
+        usuarioId: u.usuario_id,
         tokenHash: hashDoToken(token),
         expiraEm,
         agente: contexto?.agente?.slice(0, 200) ?? null,
         ip: contexto?.ip?.slice(0, 60) ?? null,
       },
-    }),
-  ]);
+    });
+  });
 
   const c = await cookies();
   c.set(COOKIE, token, {
@@ -164,39 +187,24 @@ export async function usuarioAtual(): Promise<UsuarioDaSessao | null> {
   const token = c.get(COOKIE)?.value;
   if (!token) return null;
 
-  const sessao = await prisma.sessao.findUnique({
-    where: { tokenHash: hashDoToken(token) },
-    select: {
-      expiraEm: true,
-      revogadaEm: true,
-      usuario: {
-        select: {
-          id: true,
-          nome: true,
-          email: true,
-          papel: true,
-          grupoId: true,
-          ativo: true,
-          empresaId: true,
-          empresa: { select: { nome: true, ativa: true } },
-        },
-      },
-    },
-  });
+  const linhas = await prisma.$queryRaw<LinhaDeSessao[]>`
+    SELECT * FROM sessao_por_token(${hashDoToken(token)})
+  `;
+  const s = linhas[0];
 
-  if (!sessao) return null;
-  if (sessao.revogadaEm) return null;
-  if (sessao.expiraEm <= new Date()) return null;
-  if (!sessao.usuario.ativo || !sessao.usuario.empresa.ativa) return null;
+  if (!s) return null;
+  if (s.revogada_em) return null;
+  if (s.expira_em <= new Date()) return null;
+  if (!s.usuario_ativo || !s.empresa_ativa) return null;
 
   return {
-    id: sessao.usuario.id,
-    nome: sessao.usuario.nome,
-    email: sessao.usuario.email,
-    empresaId: sessao.usuario.empresaId,
-    empresaNome: sessao.usuario.empresa.nome,
-    ehAdmin: sessao.usuario.papel === 'ADMIN',
-    grupoId: sessao.usuario.grupoId,
+    id: s.usuario_id,
+    nome: s.nome,
+    email: s.email,
+    empresaId: s.empresa_id,
+    empresaNome: s.empresa_nome,
+    ehAdmin: s.papel === 'ADMIN',
+    grupoId: s.grupo_id,
   };
 }
 
@@ -206,12 +214,13 @@ export async function sair(): Promise<void> {
   const token = c.get(COOKIE)?.value;
 
   if (token) {
-    // `updateMany` e nao `update`: token invalido nao pode virar excecao numa
-    // acao cujo unico objetivo e sair.
-    await prisma.sessao.updateMany({
-      where: { tokenHash: hashDoToken(token), revogadaEm: null },
-      data: { revogadaEm: new Date() },
-    });
+    // Pela funcao, e nao por `updateMany` sob RLS: sair tem que funcionar
+    // sempre, inclusive quando a sessao ja nao e legivel pelo contexto atual.
+    await prisma
+      .$queryRaw`SELECT revogar_sessao(${hashDoToken(token)})`
+      .catch(() => {
+        /* sair nunca pode falhar por causa do banco; o cookie ja resolve */
+      });
   }
 
   c.delete(COOKIE);

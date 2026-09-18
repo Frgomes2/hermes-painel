@@ -22,22 +22,44 @@ import { Prisma, PrismaClient } from '@prisma/client';
  * para outra na primeira consulta.
  */
 
+/**
+ * Confere TODAS as variaveis de uma vez.
+ *
+ * Reclamar de uma por vez transforma a configuracao numa escada: falta a
+ * primeira, corrige, implanta, espera, falta a segunda. Com quatro variaveis e
+ * um deploy de minutos, isso e meia hora jogada fora. A lista inteira sai de
+ * uma vez, com o que cada uma e.
+ */
+function conferirAmbiente(): void {
+  const exigidas: { nome: string; porque: string }[] = [
+    { nome: 'DATABASE_URL', porque: 'o mesmo banco do Hermes' },
+    { nome: 'APP_DB_PASSWORD', porque: 'senha do papel hermes_app, a mesma do Hermes' },
+    { nome: 'HERMES_API_URL', porque: 'endereco do Hermes, ex.: http://hermes.railway.internal:8080' },
+    { nome: 'INTERNAL_API_SECRET', porque: 'o MESMO valor do servico do Hermes' },
+  ];
+
+  const faltando = exigidas.filter((v) => !process.env[v.nome]);
+  if (faltando.length === 0) return;
+
+  throw new Error(
+    `Faltam ${faltando.length} variavel(is) no servico do painel:\n` +
+      faltando.map((v) => `  - ${v.nome}: ${v.porque}`).join('\n') +
+      '\n\nNa Railway: aba Variables do servico do painel. Lembre de IMPLANTAR ' +
+      'depois de alterar — variavel mexida fica em rascunho ate o deploy.'
+  );
+}
+
 function urlDaAplicacao(): string {
-  const bruta = process.env.DATABASE_URL;
-  if (!bruta) throw new Error('DATABASE_URL ausente');
+  conferirAmbiente();
 
-  const senha = process.env.APP_DB_PASSWORD;
-  if (!senha) {
-    throw new Error(
-      'APP_DB_PASSWORD ausente. O painel se recusa a subir com a conexao de ' +
-        'administracao: na Railway ela e superusuario, e superusuario IGNORA row ' +
-        'level security — o painel mostraria os dados de uma empresa para outra.'
-    );
-  }
-
-  const u = new URL(bruta);
+  // Sem `APP_DB_PASSWORD` o painel se recusa a funcionar: na Railway a conexao
+  // de administracao e superusuario, e superusuario IGNORA row level security —
+  // o painel mostraria os dados de uma barbearia para outra na primeira
+  // consulta. No Hermes isso e so um aviso, porque derrubar o servico deixaria
+  // clientes sem atendimento; aqui nao ha essa desculpa.
+  const u = new URL(process.env.DATABASE_URL!);
   u.username = 'hermes_app';
-  u.password = senha;
+  u.password = process.env.APP_DB_PASSWORD!;
   return u.toString();
 }
 
