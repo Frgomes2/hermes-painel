@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+/*
+ * Tema claro, e so ele.
+ *
+ * O Atlas-Painel teve o problema de nascer com `className="dark"` no layout raiz
+ * enquanto o layout novo usava cores claras fixas: a tela aparecia com dois
+ * temas ao mesmo tempo. Se um dia voltar o modo escuro, ele precisa valer para
+ * os dois lados.
+ */
+:root {
+  --fundo: #f1f5f9;
+  --barra: #1e293b;
+  --barra-ativo: #334155;
+  --azul: #2563eb;
+  --texto: #0f172a;
+  --suave: #64748b;
+  --borda: #e2e8f0;
+}
+
+html, body {
+  background: var(--fundo);
+  color: var(--texto);
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}

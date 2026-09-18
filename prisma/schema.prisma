@@ -1,0 +1,669 @@
+// Plataforma de agentes — modelo de dados.
+//
+// Regras que valem para o schema inteiro:
+//
+// 1. TODA tabela de negocio tem `empresaId`. E a coluna que o Row Level
+//    Security usa; sem ela a tabela nao entra na politica e vira vazamento.
+//
+// 2. Instante e `DateTime` COM `@db.Timestamptz(3)` — sempre, sem excecao.
+//    O padrao do Prisma para `DateTime` no Postgres e `timestamp(3)` SEM fuso.
+//    Isso nao e detalhe de estilo:
+//      - `timestamp` sem fuso guarda "10:00" sem dizer 10:00 de onde;
+//      - a constraint de sobreposicao da agenda nem chega a ser criada, porque
+//        converter timestamp -> timestamptz depende do TimeZone da sessao, o
+//        que torna a expressao STABLE, e indice exige IMMUTABLE (erro 42P17).
+//    Campo de data novo sem `@db.Timestamptz(3)` e bug esperando acontecer.
+//
+//    Horario comercial que se repete toda semana NAO e instante: e hora local
+//    da empresa, guardada em minutos desde a meia-noite (`Int`). Misturar os
+//    dois foi o que fez o cardapio de segunda aparecer como domingo no Atlas.
+//
+// 3. O que o Prisma nao expressa esta em prisma/sql/:
+//    - politicas de RLS            -> 01-rls.sql
+//    - constraint de sobreposicao  -> 02-agenda.sql
+//    Rodar SEMPRE depois do `migrate deploy`/`db push`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===========================================================================
+// PLATAFORMA — sem empresaId, fora do RLS
+// ===========================================================================
+
+model Empresa {
+  id       String  @id @default(uuid())
+  nome     String
+  /// Usado na URL do portal publico e no nome das instancias do WhatsApp
+  slug     String  @unique
+  segmento String  @default("barbearia")
+  /// IANA, ex.: America/Sao_Paulo. Toda conversao de horario passa por aqui.
+  timezone String  @default("America/Sao_Paulo")
+
+  documento String?
+  telefone  String?
+  email     String?
+  endereco  String?
+
+  ativa    Boolean  @default(true)
+  criadoEm DateTime @default(now()) @db.Timestamptz(3)
+
+  modulos       ModuloContratado[]
+  usuarios      Usuario[]
+  grupos        Grupo[]
+  permissoes    Permissao[]
+  profissionaisServicos ProfissionalServico[]
+  servicos      Servico[]
+  profissionais Profissional[]
+  expedientes   Expediente[]
+  intervalos    Intervalo[]
+  bloqueios     Bloqueio[]
+  regras        RegraAgendamento?
+  pagamentos    FormaPagamento[]
+  informacoes   Informacao[]
+  clientes      Cliente[]
+  conversas     Conversa[]
+  mensagens     Mensagem[]
+  agendamentos  Agendamento[]
+  agentes       Agente[]
+  canais        Canal[]
+  acoes         AcaoDoAgente[]
+  sessoes       Sessao[]
+
+  @@map("empresas")
+}
+
+/// Super Admin da plataforma. Nao pertence a empresa nenhuma.
+model UsuarioPlataforma {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  nome      String
+  senhaHash String
+  ativo     Boolean  @default(true)
+  criadoEm  DateTime @default(now()) @db.Timestamptz(3)
+
+  @@map("usuarios_plataforma")
+}
+
+/// Catalogo de modulos vendaveis. Cobranca e por modulo, nao por plano.
+model Modulo {
+  id        String  @id @default(uuid())
+  chave     String  @unique // 'agenda', 'bot', 'financeiro', 'fidelidade'
+  nome      String
+  descricao String?
+  precoMes  Decimal @db.Decimal(10, 2)
+  ativo     Boolean @default(true)
+
+  contratos ModuloContratado[]
+
+  @@map("modulos")
+}
+
+model ModuloContratado {
+  id        String    @id @default(uuid())
+  empresaId String
+  moduloId  String
+  ativo     Boolean   @default(true)
+  desde     DateTime @default(now()) @db.Timestamptz(3)
+  ate       DateTime? @db.Timestamptz(3)
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  modulo  Modulo  @relation(fields: [moduloId], references: [id])
+
+  @@unique([empresaId, moduloId])
+  @@map("modulos_contratados")
+}
+
+// ===========================================================================
+// ACESSO AO PAINEL DA EMPRESA
+// ===========================================================================
+
+enum Papel {
+  /// Superusuario da empresa: enxerga tudo, gerencia grupos e usuarios.
+  /// Existe como saida de emergencia — sem ele, salvar a permissao errada
+  /// tranca todo mundo para fora, inclusive da tela de grupos.
+  ADMIN
+  MEMBRO
+}
+
+enum Acao {
+  VER
+  CRIAR
+  EDITAR
+  EXCLUIR
+}
+
+model Usuario {
+  id        String  @id @default(uuid())
+  empresaId String
+  email     String
+  nome      String
+  senhaHash String
+  papel     Papel   @default(MEMBRO)
+  ativo     Boolean @default(true)
+
+  /// Bloqueio progressivo contra tentativa em massa
+  tentativas   Int       @default(0)
+  bloqueadoAte DateTime? @db.Timestamptz(3)
+  ultimoAcesso DateTime? @db.Timestamptz(3)
+
+  grupoId String?
+  grupo   Grupo?  @relation(fields: [grupoId], references: [id], onDelete: SetNull)
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  sessoes Sessao[]
+
+  criadoEm DateTime @default(now()) @db.Timestamptz(3)
+
+  /// E-mail e unico DENTRO da empresa: a mesma pessoa pode atender dois clientes
+  @@unique([empresaId, email])
+  @@map("usuarios")
+}
+
+/// Sessao do painel, em TABELA e nao em token assinado.
+///
+/// Token assinado nao se cancela: demitir alguem, ou perceber um acesso
+/// indevido, deixaria a sessao dela valendo ate expirar sozinha. Com linha no
+/// banco, revogar e um UPDATE — e trocar a senha de alguem derruba tudo que
+/// estava aberto no nome dela.
+///
+/// O custo e uma consulta por requisicao autenticada. Num painel interno isso
+/// nao se sente, e a troca compensa.
+model Sessao {
+  id        String @id @default(uuid())
+  empresaId String
+  usuarioId String
+
+  /// Hash do token, nunca o token. Vazamento do banco nao vira sessao ativa,
+  /// pela mesma razao que senha nao se guarda em texto.
+  tokenHash String @unique
+
+  expiraEm   DateTime  @db.Timestamptz(3)
+  revogadaEm DateTime? @db.Timestamptz(3)
+
+  /// So para a pessoa reconhecer a propria sessao na lista. Nao autentica nada.
+  agente String?
+  ip     String?
+
+  criadoEm DateTime @default(now()) @db.Timestamptz(3)
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@index([usuarioId])
+  @@index([expiraEm])
+  @@map("sessoes")
+}
+
+model Grupo {
+  id        String  @id @default(uuid())
+  empresaId String
+  nome      String
+  descricao String?
+  ativo     Boolean @default(true)
+
+  empresa    Empresa     @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  usuarios   Usuario[]
+  permissoes Permissao[]
+
+  @@unique([empresaId, nome])
+  @@map("grupos")
+}
+
+/// Permissao por MENU, com acoes. A rota e a chave: cadastrou a tela, ela ja
+/// entra no controle de acesso sem alterar codigo.
+model Permissao {
+  id String @id @default(uuid())
+  /// Redundante com grupo.empresaId, e de proposito: o RLS filtra por coluna
+  /// da propria tabela. Sem ela a politica nao pode existir e a tabela fica
+  /// sem isolamento.
+  empresaId String
+  grupoId   String
+  rota      String
+  acoes     Acao[]
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  grupo   Grupo   @relation(fields: [grupoId], references: [id], onDelete: Cascade)
+
+  @@unique([grupoId, rota])
+  @@map("permissoes")
+}
+
+// ===========================================================================
+// CADASTRO DO NEGOCIO
+// ===========================================================================
+
+model Servico {
+  id        String  @id @default(uuid())
+  empresaId String
+  nome      String
+  descricao String?
+  preco     Decimal @db.Decimal(10, 2)
+  /// Duracao do atendimento, em minutos
+  duracaoMin Int
+  /// Folga depois do atendimento (limpeza, troca). Ocupa a agenda, nao e cobrada.
+  folgaMin   Int     @default(0)
+  ordem      Int     @default(0)
+  ativo      Boolean @default(true)
+
+  empresa      Empresa              @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  profissionais ProfissionalServico[]
+  agendamentos  Agendamento[]
+
+  @@unique([empresaId, nome])
+  @@map("servicos")
+}
+
+model Profissional {
+  id        String  @id @default(uuid())
+  empresaId String
+  nome      String
+  /// Como o agente se refere a ele na conversa ("com o Rafa")
+  apelido   String?
+  telefone  String?
+  ativo     Boolean @default(true)
+
+  empresa      Empresa              @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  servicos     ProfissionalServico[]
+  expedientes  Expediente[]
+  bloqueios    Bloqueio[]
+  agendamentos Agendamento[]
+
+  @@unique([empresaId, nome])
+  @@map("profissionais")
+}
+
+model ProfissionalServico {
+  /// Tabela de juncao tambem entra no RLS. Sem isso, uma consulta direta aqui
+  /// devolveria os pares de TODAS as empresas — ids, mas ainda assim vazamento.
+  empresaId      String
+  profissionalId String
+  servicoId      String
+  /// Duracao propria, quando este profissional demora diferente do padrao
+  duracaoMin     Int?
+
+  empresa      Empresa      @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  profissional Profissional @relation(fields: [profissionalId], references: [id], onDelete: Cascade)
+  servico      Servico      @relation(fields: [servicoId], references: [id], onDelete: Cascade)
+
+  @@id([profissionalId, servicoId])
+  @@map("profissionais_servicos")
+}
+
+/// Janela de atendimento que se repete toda semana.
+///
+/// `profissionalId` nulo = expediente padrao da empresa.
+/// Preenchido = expediente daquele profissional, que SUBSTITUI o da empresa.
+///
+/// Horas em minutos desde a meia-noite, no fuso da empresa. 08:00 = 480.
+/// Nao e instante: nao tem data, nao tem UTC, nao sofre com horario de verao.
+model Expediente {
+  id             String  @id @default(uuid())
+  empresaId      String
+  profissionalId String?
+  /// 0 = domingo ... 6 = sabado (compativel com Date.getDay e luxon weekday % 7)
+  diaSemana      Int
+  inicioMin      Int
+  fimMin         Int
+
+  empresa      Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  profissional Profissional? @relation(fields: [profissionalId], references: [id], onDelete: Cascade)
+  intervalos   Intervalo[]
+
+  @@index([empresaId, diaSemana])
+  @@map("expedientes")
+}
+
+/// Almoco e pausas, dentro de um expediente. Mesma unidade: minutos locais.
+model Intervalo {
+  id           String @id @default(uuid())
+  empresaId    String
+  expedienteId String
+  inicioMin    Int
+  fimMin       Int
+
+  empresa    Empresa    @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  expediente Expediente @relation(fields: [expedienteId], references: [id], onDelete: Cascade)
+
+  @@map("intervalos")
+}
+
+/// Feriado, ferias, imprevisto. `profissionalId` nulo = fecha a empresa toda.
+model Bloqueio {
+  id             String   @id @default(uuid())
+  empresaId      String
+  profissionalId String?
+  inicio         DateTime @db.Timestamptz(3)
+  fim            DateTime @db.Timestamptz(3)
+  motivo         String?
+
+  empresa      Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  profissional Profissional? @relation(fields: [profissionalId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId, inicio])
+  @@map("bloqueios")
+}
+
+/// Como os horarios livres viram opcoes oferecidas ao cliente.
+///
+/// A escolha e da empresa porque muda o negocio, nao so a tela: grade fixa
+/// perde alguns minutos por dia e ganha uma agenda que o barbeiro consegue ler;
+/// encaixe aproveita tudo e produz horarios quebrados.
+enum ModoGrade {
+  /// Horarios sempre em multiplos de `passoMin` a partir do inicio do
+  /// expediente: 09:00, 09:15, 09:30... Um atendimento que termina 09:50 gera a
+  /// proxima vaga as 10:00.
+  GRADE_FIXA
+
+  /// A vaga comeca assim que a anterior termina (mais a folga do servico).
+  /// Aproveita todo o tempo, ao custo de horarios como 09:50 e 10:23.
+  ENCAIXE
+
+  /// Grade fixa, mas se sobrar um buraco que caiba exatamente um atendimento
+  /// e que a grade nao alcance, ele tambem e oferecido.
+  GRADE_COM_ENCAIXE_FINAL
+}
+
+model RegraAgendamento {
+  id        String @id @default(uuid())
+  empresaId String @unique
+
+  /// Nao aceita agendamento com menos de X minutos de antecedencia
+  antecedenciaMinMin Int @default(60)
+  /// Nao aceita agendamento a mais de X dias no futuro
+  horizonteDias      Int @default(30)
+  /// Cancelamento permitido ate X minutos antes
+  cancelamentoAteMin Int @default(120)
+  /// Passo da grade de horarios oferecidos (15 = 09:00, 09:15, 09:30...)
+  passoMin           Int @default(15)
+  /// Como os horarios livres sao oferecidos. Ver enum ModoGrade.
+  modoGrade          ModoGrade @default(GRADE_FIXA)
+  /// Limite de agendamentos futuros por cliente, para evitar bloqueio de agenda
+  maxPorCliente      Int @default(3)
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@map("regras_agendamento")
+}
+
+model FormaPagamento {
+  id        String  @id @default(uuid())
+  empresaId String
+  nome      String
+  ativo     Boolean @default(true)
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@unique([empresaId, nome])
+  @@map("formas_pagamento")
+}
+
+/// FAQ livre: estacionamento, wi-fi, acessibilidade, politica de atraso.
+/// O agente consulta isto em vez de ter texto solto no prompt.
+model Informacao {
+  id        String  @id @default(uuid())
+  empresaId String
+  titulo    String
+  conteudo  String
+  ordem     Int     @default(0)
+  ativo     Boolean @default(true)
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@map("informacoes")
+}
+
+// ===========================================================================
+// AGENTE E CANAIS
+// ===========================================================================
+
+enum RuntimeAgente {
+  /// Roda no worker desta plataforma
+  PLATAFORMA
+  /// Roda em outro servico; o painel so configura pela API interna dele.
+  /// E assim que o Agente Atlas entra aqui sem ser migrado.
+  EXTERNO
+}
+
+model Agente {
+  id        String @id @default(uuid())
+  empresaId String
+  /// Chave do TipoDeAgente, que vive no CODIGO (ferramenta e codigo).
+  /// ex.: 'atendimento_agendamento', 'assistente_pessoal'
+  tipo      String
+  nome      String
+
+  /// Nasce inativo de proposito: ativar e ato explicito, com cadastro completo.
+  ativo     Boolean @default(false)
+
+  runtime        RuntimeAgente @default(PLATAFORMA)
+  runtimeUrl     String?
+  /// Cifrado (AES-256-GCM). Nunca devolvido ao painel em texto.
+  runtimeSegredo String?
+
+  /// Ferramentas liberadas. Vazio = as padrao do tipo.
+  /// Ferramenta fora desta lista NAO e enviada ao modelo: proibir no prompt
+  /// nao funciona, o modelo desobedece.
+  ferramentas String[]
+
+  /// Ajustes de redacao: tom, saudacao, assinatura
+  tom       String?
+  saudacao  String?
+
+  /// Teto mensal de mensagens processadas. Sem isso, um cliente de volume alto
+  /// consome a margem de todos os outros.
+  limiteMensagensMes Int @default(2000)
+
+  empresa   Empresa        @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  canais    Canal[]
+  conversas Conversa[]
+  acoes     AcaoDoAgente[]
+
+  criadoEm DateTime @default(now()) @db.Timestamptz(3)
+
+  @@map("agentes")
+}
+
+enum StatusCanal {
+  DESCONECTADO
+  AGUARDANDO_QR
+  CONECTADO
+}
+
+/// Um numero de WhatsApp. Um agente pode ter varios; um numero pertence a um
+/// agente so.
+model Canal {
+  id        String @id @default(uuid())
+  empresaId String
+  agenteId  String
+
+  provedor  String @default("evolution") // 'evolution' | 'cloud'
+  /// Nome da instancia no provedor. SENSIVEL A MAIUSCULAS na Evolution.
+  instancia String
+  /// E.164, preenchido quando a instancia conecta e reporta o numero
+  numero    String?
+  /// Cifrado
+  credenciais String?
+
+  status StatusCanal @default(DESCONECTADO)
+  ativo  Boolean     @default(true)
+
+  ultimoEventoEm DateTime? @db.Timestamptz(3)
+
+  empresa   Empresa    @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  agente    Agente     @relation(fields: [agenteId], references: [id], onDelete: Cascade)
+  conversas Conversa[]
+
+  /// A chave do roteamento: webhook traz a instancia, aqui se acha o agente.
+  /// Sem esta unicidade, uma mensagem poderia cair na empresa errada.
+  @@unique([provedor, instancia])
+  @@map("canais")
+}
+
+// ===========================================================================
+// OPERACAO
+// ===========================================================================
+
+model Cliente {
+  id        String  @id @default(uuid())
+  empresaId String
+  /// So digitos, com DDI. E a chave natural de quem manda mensagem.
+  telefone  String
+  nome      String?
+  observacao String?
+
+  empresa      Empresa       @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  conversas    Conversa[]
+  agendamentos Agendamento[]
+
+  criadoEm DateTime @default(now()) @db.Timestamptz(3)
+
+  @@unique([empresaId, telefone])
+  @@map("clientes")
+}
+
+enum StatusConversa {
+  ATIVA
+  /// Um humano assumiu. O agente NAO responde enquanto estiver assim.
+  AGUARDANDO_HUMANO
+  ENCERRADA
+}
+
+/// Conversa e por CANAL, nao por agente: se o cliente falar com dois numeros
+/// da mesma empresa, sao dois historicos. Ele espera continuidade no numero
+/// em que esta falando.
+model Conversa {
+  id        String @id @default(uuid())
+  empresaId String
+  /// OPCIONAL por causa do simulador do painel: uma conversa de teste nao veio
+  /// de canal nenhum. Manter obrigatorio exigiria inventar um canal falso, que
+  /// apareceria nas telas de canal e nos relatorios como se fosse um numero de
+  /// verdade. `null` aqui significa exatamente o que parece: nao veio do
+  /// WhatsApp. No indice unico abaixo, `null` nunca colide — entao cada sessao
+  /// do simulador pode ser uma conversa nova, que e o comportamento desejado.
+  canalId   String?
+  agenteId  String
+  clienteId String
+
+  status StatusConversa @default(ATIVA)
+  /// Quem assumiu, quando um humano entra
+  assumidoPor String?
+  assumidoEm  DateTime? @db.Timestamptz(3)
+
+  ultimaMensagemEm DateTime @default(now()) @db.Timestamptz(3)
+  criadoEm         DateTime @default(now()) @db.Timestamptz(3)
+
+  empresa   Empresa    @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  canal     Canal?     @relation(fields: [canalId], references: [id], onDelete: Cascade)
+  agente    Agente     @relation(fields: [agenteId], references: [id], onDelete: Cascade)
+  cliente   Cliente    @relation(fields: [clienteId], references: [id], onDelete: Cascade)
+  mensagens Mensagem[]
+
+  @@unique([canalId, clienteId])
+  @@index([empresaId, ultimaMensagemEm])
+  @@map("conversas")
+}
+
+model Mensagem {
+  id         String @id @default(uuid())
+  empresaId  String
+  conversaId String
+
+  /// 'cliente' | 'agente' | 'humano'
+  papel    String
+  conteudo String
+  /// Id da mensagem no provedor, para nao processar o mesmo webhook duas vezes
+  idExterno String?
+
+  criadoEm DateTime @default(now()) @db.Timestamptz(3)
+
+  empresa  Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  conversa Conversa @relation(fields: [conversaId], references: [id], onDelete: Cascade)
+
+  @@unique([empresaId, idExterno])
+  @@index([conversaId, criadoEm])
+  @@map("mensagens")
+}
+
+enum StatusAgendamento {
+  PENDENTE
+  CONFIRMADO
+  CONCLUIDO
+  CANCELADO
+  FALTOU
+}
+
+model Agendamento {
+  id             String @id @default(uuid())
+  empresaId      String
+  clienteId      String
+  servicoId      String
+  profissionalId String
+
+  /// Instantes, em UTC. A hora local do cliente sai da conversao com o
+  /// timezone da empresa — nunca do fuso do servidor.
+  inicio DateTime @db.Timestamptz(3)
+  /// Ja inclui a folga do servico: e o que a agenda realmente ocupa.
+  fim    DateTime @db.Timestamptz(3)
+
+  status StatusAgendamento @default(CONFIRMADO)
+  /// 'agente' | 'painel' | 'portal'
+  origem String            @default("agente")
+  /// Preco no momento do agendamento. Mudar a tabela nao reescreve o passado.
+  preco  Decimal?          @db.Decimal(10, 2)
+  observacao String?
+
+  /// So para status PENDENTE: ate quando a reserva segura o horario.
+  ///
+  /// O PENDENTE nao e rascunho — ele JA ocupa a agenda, porque a constraint de
+  /// sobreposicao inclui PENDENTE. E assim que dois clientes conversando ao
+  /// mesmo tempo nao conseguem segurar o mesmo horario. Passado este instante,
+  /// a reserva e considerada abandonada e liberada.
+  reservadoAte DateTime? @db.Timestamptz(3)
+
+  canceladoEm  DateTime? @db.Timestamptz(3)
+  canceladoPor String?
+
+  empresa      Empresa      @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  cliente      Cliente      @relation(fields: [clienteId], references: [id], onDelete: Cascade)
+  servico      Servico      @relation(fields: [servicoId], references: [id])
+  profissional Profissional @relation(fields: [profissionalId], references: [id])
+
+  criadoEm DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([empresaId, inicio])
+  @@index([profissionalId, inicio])
+  @@map("agendamentos")
+}
+
+/// Log do que o agente fez. Serve para auditoria, para depurar sem adivinhar
+/// e para medir custo por empresa.
+model AcaoDoAgente {
+  id        String @id @default(uuid())
+  empresaId String
+  agenteId  String
+  conversaId String?
+
+  ferramenta String
+  argumentos Json?
+  resultado  Json?
+  /// false quando a acao falhou; o texto do erro vai em `resultado`
+  sucesso    Boolean @default(true)
+
+  modelo     String?
+  latenciaMs Int?
+  tokens     Int?
+
+  criadoEm DateTime @default(now()) @db.Timestamptz(3)
+
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  agente  Agente  @relation(fields: [agenteId], references: [id], onDelete: Cascade)
+
+  @@index([empresaId, criadoEm])
+  @@map("acoes_do_agente")
+}
